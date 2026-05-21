@@ -15,6 +15,19 @@ import torch, time, pyaudio, socket, pygame, os, requests, serial, json, sys
 import threading
 from faster_whisper import WhisperModel
 
+USE_HAILO_ENCODER = True
+HAILO_ENCODER_HEF = "base-whisper-encoder-5s_h8l.hef"  # your file
+HAILO_WINDOW_SECONDS = 5  # matches the 5s HEF
+USE_GOOGLE_STT = False
+
+# Optional: if you saved a local decoder+processor folder, set it here.
+DECODER_LOCAL_DIR = None  # e.g. "assets/whisper-base"
+
+hailo_enc = None
+hf_processor = None
+hf_decoder = None
+stt_model_faster_whisper = None
+
 # --- Global State and Configuration ---
 program_state = {
     "last_command" : "nyalakan_lampu",
@@ -25,6 +38,7 @@ program_state = {
 
 ESP = None
 USING_ESP = True
+
 
 SEND_TO_WEBSERVER = True
 WEB_SERVER_URL = "http://10.0.0.76:5000/task"
@@ -102,12 +116,43 @@ except Exception as e:
 
 
 # Inisialisasi model STT (faster-whisper)
+# try:
+#     stt_model_faster_whisper = WhisperModel("base", device="cpu", compute_type="int8")
+#     print("Model STT (faster-whisper 'base') berhasil dimuat.")
+# except Exception as e:
+#     print(f"Gagal memuat model STT (faster-whisper): {e}. Program mungkin tidak berfungsi dengan benar.")
+#     sys.exit(1)
+
+# Inisialisasi STT (Hailo encoder + HF decoder) atau fallback ke faster-whisper
+
 try:
-    stt_model_faster_whisper = WhisperModel("base", device="cpu", compute_type="int8")
-    print("Model STT (faster-whisper 'base') berhasil dimuat.")
+    if USE_HAILO_ENCODER:
+        from hailo_whisper import HailoWhisperEncoder
+        from transformers import WhisperForConditionalGeneration, AutoProcessor
+
+        hailo_enc = HailoWhisperEncoder(HAILO_ENCODER_HEF, float_output=True)
+
+        if DECODER_LOCAL_DIR:
+            hf_processor = AutoProcessor.from_pretrained(DECODER_LOCAL_DIR)
+            hf_decoder   = WhisperForConditionalGeneration.from_pretrained(DECODER_LOCAL_DIR).eval().to("cpu")
+        else:
+            # Decoder + feature extractor for Whisper-base
+            hf_processor = AutoProcessor.from_pretrained("openai/whisper-base")
+            hf_decoder   = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base").eval().to("cpu")
+
+        print("STT siap: Hailo encoder (base, 5s) + HF decoder (CPU).")
+    else:
+        raise RuntimeError("USE_HAILO_ENCODER is False")
 except Exception as e:
-    print(f"Gagal memuat model STT (faster-whisper): {e}. Program mungkin tidak berfungsi dengan benar.")
-    sys.exit(1)
+    print(f"Gagal init Hailo encoder pipeline: {e}. Fallback ke faster-whisper.")
+    try:
+        from faster_whisper import WhisperModel
+        stt_model_faster_whisper = WhisperModel("base", device="cpu", compute_type="int8")
+        print("Model STT (faster-whisper 'base') berhasil dimuat.")
+    except Exception as e2:
+        print(f"Gagal memuat model STT (faster-whisper): {e2}")
+        sys.exit(1)
+
 
 wake_model = None
 
@@ -187,6 +232,8 @@ def connect_to_wifi(ssid, password):
     return False
 
 def is_internet_connected(timeout=2):
+    if not USE_GOOGLE_STT:
+        return False
     try:
         socket.create_connection(("8.8.8.8", 53), timeout=timeout)
         return True
@@ -268,7 +315,7 @@ def check_speakers():
         if p:
             p.terminate()
 
-def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
+def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=44100):
     chunk_duration = 0.5
     chunk_samples = int(chunk_duration * sampling_rate)
     total_audio = []
@@ -339,7 +386,7 @@ def online_stt_recognize(audio_data_sr, language, result_container):
         print(f"Google STT: Error tak terduga: {e}")
         result_container['text'] = ""
 
-def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
+def record_audio(duration=2, sampling_rate=44100, noise_reduce=True, dynamic=True):
     if dynamic:
         audio_data = record_audio_dynamic(duration_min=duration, duration_max=5, silence_duration=1, sampling_rate=sampling_rate)
     else:
@@ -392,7 +439,7 @@ def reduce_noise(audio, noise_sample, sr_rate, prop_decrease=0.8):
         print(f"Error dalam noise reduction: {e}")
         return audio
 
-def save_audio(audio_array, filename, sampling_rate=16000):
+def save_audio(audio_array, filename, sampling_rate=44100):
     try:
         if audio_array.size == 0:
             print(f"Tidak ada data audio untuk disimpan ke {filename}.")
@@ -407,7 +454,7 @@ def save_audio(audio_array, filename, sampling_rate=16000):
     except Exception as e:
         print(f"Gagal menyimpan audio ke {filename}: {e}")
 
-def is_audio_present(audio_array_float32, threshold=0.005):
+def is_audio_present(audio_array_float32, threshold=0.003):
     if audio_array_float32.size == 0:
         print("Audio array kosong, tidak ada audio terdeteksi.")
         return False
@@ -415,37 +462,91 @@ def is_audio_present(audio_array_float32, threshold=0.005):
     print(f"Audio presence check value: {audio_value} (Threshold: {threshold})")
     return audio_value > threshold
 
-def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indonesian"):
-    global stt_model_faster_whisper 
+def _fit_to_hailo_window(feats_np, window_seconds):
+    # feats_np: (1, 80, T_any). Whisper uses 3000 frames for 30s.
+    import numpy as np
+    target_T = int(3000 * window_seconds / 30)  # 5s -> 500
+    T = feats_np.shape[2]
+    if T == target_T:
+        return feats_np
+    if T > target_T:
+        return feats_np[:, :, :target_T]
+    pad = np.zeros((1, 80, target_T - T), dtype=feats_np.dtype)
+    return np.concatenate([feats_np, pad], axis=2)
 
-    if audio_array_float32.size == 0:
-        print("Tidak ada data audio untuk ditranskripsi (faster-whisper).")
+def transcribe_audio(audio_array_float32, sampling_rate=44100, language="Indonesian"):
+    # Hailo encoder + HF decoder
+    if hailo_enc is not None and hf_processor is not None and hf_decoder is not None:
+        try:
+            import time, numpy as np, torch, transformers
+            from packaging import version
+            from transformers.modeling_outputs import BaseModelOutput
+
+            if audio_array_float32.size == 0:
+                return {'text': '', 'processing_time': 0}
+
+            start = time.time()
+            inputs = hf_processor(audio_array_float32, sampling_rate=sampling_rate, return_tensors="np")
+            feats = inputs["input_features"].astype(np.float32)
+
+            if feats.size == 0 or feats.shape[-1] == 0:
+                feats = np.zeros((1, 80, int(3000 * HAILO_WINDOW_SECONDS / 30)), dtype=np.float32)
+            feats = _fit_to_hailo_window(feats, HAILO_WINDOW_SECONDS)
+            feats = np.ascontiguousarray(feats, dtype=np.float32)
+
+            enc_np = hailo_enc.encode(feats)
+            enc_t = torch.from_numpy(enc_np).to("cpu")
+            enc_out = BaseModelOutput(last_hidden_state=enc_t)
+
+            lang_map = {"Indonesian": "indonesian", "English": "english", "Japanese": "japanese"}
+            lang_name = lang_map.get(language, "indonesian")
+            gen_kwargs = dict(
+                max_new_tokens=48, 
+                num_beams=1,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.15,
+                length_penalty=1.0,
+                early_stopping=True,
+                do_sample=False
+                )
+
+            if version.parse(transformers.__version__) >= version.parse("4.38.0"):
+                gen_kwargs.update({"task": "transcribe", "language": lang_name})
+            else:
+                gen_kwargs.update({"forced_decoder_ids": hf_processor.get_decoder_prompt_ids(
+                    language=lang_name, task="transcribe")})
+
+            hf_decoder.generation_config.eos_token_id = hf_decoder.config.eos_token_id
+            hf_decoder.generation_config.pad_token_id = hf_decoder.config.eos_token_id
+            hf_decoder.generation_config.do_sample = False
+            hf_decoder.generation_config.temperature = 0.0
+
+            with torch.no_grad():
+                gen_ids = hf_decoder.generate(encoder_outputs=enc_out, **gen_kwargs)
+
+            text = hf_processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+            return {'text': text, 'processing_time': time.time() - start}
+        except Exception as e:
+            print(f"Error Hailo path: {e}")
+
+    # Fallback: faster-whisper (note: OUTDENTED, runs when Hailo path not used or failed)
+    global stt_model_faster_whisper
+    if stt_model_faster_whisper is None or audio_array_float32.size == 0:
         return {'text': '', 'processing_time': 0}
-
     try:
-        start_time = time.time()
+        import time, numpy as np
+        start = time.time()
         lang_code_map = {"Indonesian": "id", "English": "en", "Japanese": "ja"}
-        fw_lang_code = lang_code_map.get(language, "id") 
-
+        fw_lang_code = lang_code_map.get(language, "id")
         if audio_array_float32.dtype != np.float32:
             audio_array_float32 = audio_array_float32.astype(np.float32)
-        
         segments, info = stt_model_faster_whisper.transcribe(
-            audio_array_float32,
-            beam_size=5,       
-            language=fw_lang_code, 
-            vad_filter=True,   
+            audio_array_float32, beam_size=5, language=fw_lang_code, vad_filter=True
         )
-        processing_time = time.time() - start_time
-        full_transcription = "".join(segment.text for segment in segments).strip()
-        return {
-            'text': full_transcription,
-            'processing_time': processing_time
-        }
+        text = "".join(s.text for s in segments).strip()
+        return {'text': text, 'processing_time': time.time() - start}
     except Exception as e:
-        print(f"Error saat transkripsi audio dengan faster-whisper: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error faster-whisper: {e}")
         return {'text': '', 'processing_time': 0}
 
 
@@ -750,7 +851,7 @@ def initialize_system():
 
 ONLINE_WAKE_WORD_CHECK_INTERVAL = 2
 ONLINE_WAKE_WORD_RECORD_DURATION = 4 
-SAMPLE_RATE = 16000 
+SAMPLE_RATE = 44100 
 SAMPLE_WIDTH_BYTES = 2 
 
 def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, samplerate, result_language_container):
@@ -806,7 +907,8 @@ def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, sam
                     if 'text' in result and result['text']:
                         detected_text = result['text'].lower().strip()
                         lang = None
-                        if "oke toyota" in detected_text or ("oke" in detected_text and "toyota" in detected_text):
+                        if ("oke toyota" in detected_text or ("oke" in detected_text and "toyota" in detected_text)) or \
+                            ("okay toyota" in detected_text):
                             lang = "Indonesian"
                         elif "hello toyota" in detected_text or ("hello" in detected_text and "toyota" in detected_text):
                             lang = "English"
@@ -870,7 +972,7 @@ def run_online_wake_word_check(wake_event, samplerate, result_language_container
     audio_float32_np = audio_int16_np.astype(np.float32) / 32768.0
 
     print(f"Online check: Audio terkumpul {len(collected_bytes)} bytes ({len(collected_bytes)/(samplerate*SAMPLE_WIDTH_BYTES):.2f}s). Memanggil is_audio_present...")
-    if not is_audio_present(audio_float32_np, threshold=0.004): 
+    if not is_audio_present(audio_float32_np, threshold=0.003): 
         print("Online check: Audio tidak signifikan terdeteksi (setelah is_audio_present).")
         return
 
@@ -932,7 +1034,7 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     stt_processing_time = 0
 
     # --- STT Phase ---
-    if internet_conn:
+    if USE_GOOGLE_STT and internet_conn:
         try:
             stt_online_start_time = time.time()
             audio_int16_cmd = (audio_float32_data * 32767).astype(np.int16)
@@ -1059,11 +1161,11 @@ if __name__ == "__main__":
 
     try:
         device_info = sd.query_devices(None, "input") 
-        SAMPLERATE = int(device_info.get("default_samplerate", 16000))
+        SAMPLERATE = int(device_info.get("default_samplerate", 44100))
         print(f"Menggunakan samplerate: {SAMPLERATE} Hz dari perangkat input default.")
     except Exception as e:
-        print(f"PERINGATAN: Gagal mendapatkan default samplerate dari SoundDevice: {e}. Menggunakan default 16000 Hz.")
-        SAMPLERATE = 16000
+        print(f"PERINGATAN: Gagal mendapatkan default samplerate dari SoundDevice: {e}. Menggunakan default 44100 Hz.")
+        SAMPLERATE = 44100
 
     audio_stream = None
     vosk_thread = None
@@ -1108,7 +1210,7 @@ if __name__ == "__main__":
                  time.sleep(2)
                  continue
 
-            vosk_grammar = json.dumps(["hello", "oke", "hai", "toyota", "moshi", "one", "two", "three", "four", "[unk]"], ensure_ascii=False)
+            vosk_grammar = json.dumps(["hello", "oke", "okay", "hai", "toyota", "moshi", "one", "two", "three", "four", "[unk]"], ensure_ascii=False)
             vosk_recognizer = KaldiRecognizer(wake_model, SAMPLERATE, vosk_grammar)
 
             vosk_thread = threading.Thread(
@@ -1182,7 +1284,7 @@ if __name__ == "__main__":
                     
                     if not relevant_command_processed_this_session.is_set() and main_loop_active_flag.is_set():
                         print(f"\nSilahkan ucapkan perintah (Bahasa: {current_predicted_language}, Sisa waktu: {remaining_time:.0f} detik)...")
-                        command_sampling_rate = 16000 
+                        command_sampling_rate = 44100 
                         recorded_audio_cmd_float32 = record_audio(
                             duration=3, 
                             sampling_rate=command_sampling_rate,
@@ -1192,7 +1294,7 @@ if __name__ == "__main__":
 
                         if not main_loop_active_flag.is_set(): break 
 
-                        if is_audio_present(recorded_audio_cmd_float32, threshold=0.001):
+                        if is_audio_present(recorded_audio_cmd_float32, threshold=0.003):
                             audio_copy_for_thread = recorded_audio_cmd_float32.copy()
                             
                             cmd_thread = threading.Thread(
@@ -1275,3 +1377,10 @@ if __name__ == "__main__":
             pygame.mixer.quit()
             print("Pygame mixer dihentikan.")
         print("Program selesai.")
+
+        try:
+            if hailo_enc is not None:
+                hailo_enc.close()
+                print("Hailo encoder ditutup.")
+        except Exception as _:
+            pass
