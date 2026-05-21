@@ -3,10 +3,6 @@
 Stages: STT -> Tool Selection -> LLM Parameter Extraction -> Tool Execution -> TTS
 """
 
-import tempfile
-import os
-import subprocess
-import soundfile as sf
 import logging
 import time
 import numpy as np
@@ -83,15 +79,8 @@ class V2APipeline:
             if self.tts_output_path:
                 sf.write(self.tts_output_path, audio_array, sample_rate)
             else:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    tmp_path = f.name
-
-                sf.write(tmp_path, audio_array, sample_rate)
-
-                try:
-                    subprocess.run(["paplay", tmp_path], check=True)
-                finally:
-                    os.remove(tmp_path)
+                sd.play(audio_array, sample_rate)
+                sd.wait()
 
         self._log_timing(timing)
         return tool_response

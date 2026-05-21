@@ -44,7 +44,7 @@ def create_parser():
 
     parser.add_argument(
         "--wake-word-model",
-        default=str(RESOURCES_DIR / "hey_hailo.onnx"),
+        default=str(RESOURCES_DIR / "hello_toyota.onnx"),
         help="Path to wake word model"
     )
 

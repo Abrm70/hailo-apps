@@ -94,7 +94,7 @@ class LLMEngine:
                 continue
             self.llm.generate_all(
                 prompt=[{"role": "system", "content": prompt}],
-                max_generated_tokens=0,
+                max_generated_tokens=1,
                 do_sample=False,
             )
             self._cached_contexts[tool_name] = self.llm.save_context()

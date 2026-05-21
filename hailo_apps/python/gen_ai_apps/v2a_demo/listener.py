@@ -1,3 +1,5 @@
+import subprocess
+from pathlib import Path
 import time
 import logging
 import threading
@@ -24,9 +26,9 @@ STREAM_CONFIG = dict(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=AUDIO_DTYP
 EMPTY_AUDIO = np.array([], dtype=AUDIO_DTYPE)
 
 # Wake word detection
-WAKE_WORD_THRESHOLD = 0.8
-WAKE_WORD_CONSECUTIVE = 2
-WAKE_SMOOTHING_FRAMES = 4
+WAKE_WORD_THRESHOLD = 0.3
+WAKE_WORD_CONSECUTIVE = 1
+WAKE_SMOOTHING_FRAMES = 1
 WAKE_WARMUP_FRAMES = 10  # early frames produce spurious scores
 
 # Recording
@@ -62,14 +64,60 @@ class WakeWordListener:
             openwakeword.utils.download_models()
 
         self._wake_word_model = openwakeword.Model(
-            wakeword_models=[wake_word_model],
-            inference_framework="onnx",
+            wakeword_model_paths=[wake_word_model],
         )
         self._wake_word_name = path.stem
         self._vad = VoiceActivityDetector(sample_rate=SAMPLE_RATE, aggressiveness=VAD_AGGRESSIVENESS)
         self._wake_timeout_s = wake_timeout_s
         self._audio_device = audio_device
         logger.info(f"Wake word model loaded: {self._wake_word_name}")
+
+    def listen(self) -> np.ndarray:
+        """Block until wake word + speech recorded using ALSA arecord."""
+        stop_event = threading.Event()
+
+        cmd = [
+            "arecord",
+            "-D", "plughw:2,0",
+            "-f", "S16_LE",
+            "-r", str(SAMPLE_RATE),
+            "-c", "1",
+            "-t", "raw",
+            "-q",
+        ]
+
+        logger.info(f"Listening for wake word '{self._wake_word_name}' using ALSA plughw:2,0...")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except Exception as e:
+            logger.error(f"Failed to start arecord: {e}")
+            return EMPTY_AUDIO
+
+        def frame_generator():
+            bytes_per_frame = CHUNK_SIZE * 2
+            while not stop_event.is_set():
+                data = proc.stdout.read(bytes_per_frame)
+                if not data or len(data) < bytes_per_frame:
+                    continue
+
+                audio_i16 = np.frombuffer(data, dtype=np.int16)
+                audio_f32 = audio_i16.astype(np.float32) / np.iinfo(np.int16).max
+                yield audio_f32
+
+        try:
+            return self._process_stream(frame_generator(), stop_event)
+        finally:
+            stop_event.set()
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
     def listen(self) -> np.ndarray:
         """Block until wake word + speech recorded, return audio (or empty array on failure)."""
@@ -176,6 +224,17 @@ class WakeWordListener:
                 consecutive += 1
                 if consecutive >= WAKE_WORD_CONSECUTIVE:
                     logger.info(f"Wake word detected (score={smoothed:.3f})")
+                    logger.info("Assistant is now listening for your command...")
+
+                    try:
+                        beep_path = Path(__file__).resolve().parent / "resources" / "assistant_awake.wav"
+                        subprocess.Popen(
+                            ["paplay", str(beep_path)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
                     return list(pre_roll)
             else:
                 consecutive = 0
@@ -217,19 +276,7 @@ class WakeWordListener:
         return np.concatenate(recorded_chunks).astype(AUDIO_DTYPE)
 
     def _validate_audio_device(self) -> None:
-        """Raise RuntimeError if no usable input device is found."""
-        try:
-            sd.check_input_settings(
-                device=self._audio_device,
-                channels=STREAM_CONFIG["channels"],
-                dtype=STREAM_CONFIG["dtype"],
-                samplerate=STREAM_CONFIG["samplerate"],
-            )
-        except sd.PortAudioError as e:
-            raise RuntimeError(
-                f"No usable audio input device (device={self._audio_device}). "
-                f"Check that a microphone is connected. PortAudio: {e}"
-            ) from e
+       return
 
     def _trim_leading_silence(self, audio: np.ndarray) -> np.ndarray:
         """Remove leading silence to prevent Whisper hallucinations on quiet audio."""
